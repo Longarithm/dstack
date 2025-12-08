@@ -292,7 +292,7 @@ impl HostShared {
             mkdir -p $host_shared_dir;
         }?;
 
-        // Try to detect and mount shared disk by label first, fallback to 9p
+        // Try to detect and mount shared disk by label first, fallback to iso9660
         let disk_device = Self::find_disk_by_label(HOST_SHARED_DISK_LABEL);
         let mounted_via_disk = if let Some(dev) = disk_device {
             info!("Found shared disk at {}", dev);
@@ -306,9 +306,9 @@ impl HostShared {
         };
 
         if !mounted_via_disk {
-            info!("Shared disk not found, trying 9p virtfs");
+            info!("Shared disk not found, trying iso9660 config disk");
             cmd! {
-                mount -t 9p -o trans=virtio,version=9p2000.L,ro host-shared $host_shared_dir;
+                mount -t iso9660 /dev/vdc $host_shared_dir;
             }?;
         } else {
             info!("Successfully mounted shared disk");
