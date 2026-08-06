@@ -25,6 +25,7 @@ use x509_parser::x509::SubjectPublicKeyInfo;
 
 use crate::oids::{
     PHALA_RATLS_APP_ID, PHALA_RATLS_APP_INFO, PHALA_RATLS_ATTESTATION, PHALA_RATLS_CERT_USAGE,
+    PHALA_RATLS_EVENT_LOG, PHALA_RATLS_TDX_QUOTE,
 };
 use crate::traits::CertExt;
 #[cfg(feature = "quote")]
@@ -383,6 +384,19 @@ impl<Key> CertRequest<'_, Key> {
         if let Some(ver_att) = self.attestation {
             let attestation_bytes = ver_att.clone().into_stripped().to_bytes()?;
             add_ext(&mut params, PHALA_RATLS_ATTESTATION, &attestation_bytes);
+            // Also emit the pre-0.5.9 pair. A KMS of that generation reads only .1.1/.1.2 and
+            // reports "No attestation provided" for a cert carrying just .1.8, which is what
+            // blocks a 0.5.11 instance from onboarding off one. The log goes out unstripped:
+            // that KMS replays all four IMRs, while into_stripped() keeps imr3 and blanks the
+            // runtime digests.
+            if let VersionedAttestation::V0 { attestation } = ver_att {
+                if let Some(tdx) = attestation.tdx_quote() {
+                    add_ext(&mut params, PHALA_RATLS_TDX_QUOTE, &tdx.quote);
+                    let event_log = serde_json::to_vec(&tdx.event_log)
+                        .context("Failed to serialize event log")?;
+                    add_ext(&mut params, PHALA_RATLS_EVENT_LOG, &event_log);
+                }
+            }
         }
         if let Some(ca_level) = self.ca_level {
             params.is_ca = IsCa::Ca(BasicConstraints::Constrained(ca_level));
@@ -645,6 +659,55 @@ mod tests {
         assert!(params.subject_alt_names.iter().any(
             |san| matches!(san, SanType::DnsName(name) if name.as_str() == "test.example.com")
         ));
+    }
+
+    #[test]
+    fn test_cert_emits_legacy_attestation_extensions() {
+        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let attestation = Attestation {
+            quote: AttestationQuote::DstackTdx(TdxQuote {
+                quote: vec![1, 2, 3],
+                event_log: vec![cc_eventlog::TdxEvent {
+                    imr: 3,
+                    event_type: 134217729,
+                    digest: vec![0xab, 0xcd],
+                    event: "test".to_string(),
+                    event_payload: vec![0xde, 0xad],
+                }],
+            }),
+            runtime_events: vec![],
+            report_data: [0u8; 64],
+            config: "".into(),
+            report: (),
+        }
+        .into_versioned();
+
+        let params = CertRequest::builder()
+            .key(&key_pair)
+            .subject("test.example.com")
+            .attestation(&attestation)
+            .build()
+            .into_cert_params()
+            .unwrap();
+
+        let ext_content = |oid: &[u64]| {
+            let ext = params
+                .custom_extensions
+                .iter()
+                .find(|e| e.oid_components().eq(oid.iter().copied()))
+                .unwrap_or_else(|| panic!("extension {oid:?} missing"));
+            yasna::parse_der(ext.content(), |r| r.read_bytes()).unwrap()
+        };
+
+        // .1.8 for a current reader, .1.1/.1.2 for a pre-0.5.9 one, which looks up only those two.
+        ext_content(PHALA_RATLS_ATTESTATION);
+        assert_eq!(ext_content(PHALA_RATLS_TDX_QUOTE), vec![1, 2, 3]);
+
+        // The legacy reader parses this as EventLog { digest: String, event_payload: String },
+        // so the bytes must be hex strings, and the digest must survive unstripped.
+        let event_log = String::from_utf8(ext_content(PHALA_RATLS_EVENT_LOG)).unwrap();
+        assert!(event_log.contains(r#""digest":"abcd""#), "{event_log}");
+        assert!(event_log.contains(r#""event_payload":"dead""#), "{event_log}");
     }
 
     #[test]
