@@ -1149,9 +1149,10 @@ impl<'a> Stage0<'a> {
                 }
                 FsType::Ext4 => {
                     info!("Creating ext4 filesystem");
+                    // -I 256 so the inode has room for i_projid; mke2fs picks 128 below 512M.
                     cmd! {
-                        mkfs.ext4 -F $fs_dev;
-                        mount $fs_dev $mount_point;
+                        mkfs.ext4 -F -I 256 -O project,quota $fs_dev;
+                        mount -o prjquota $fs_dev $mount_point;
                     }
                     .context("Failed to create ext4 filesystem")?;
                 }
@@ -1217,11 +1218,13 @@ impl<'a> Stage0<'a> {
             }
         }
 
+        // prjquota must match the create path: enforcement is armed at mount time, not by the
+        // superblock feature, so omitting it here leaves the disk accounting-only after a reboot.
         cmd! {
             info "Trying to resize filesystem if needed";
             resize2fs $dev;
             info "Mounting filesystem";
-            mount $dev $mount_point;
+            mount -o prjquota $dev $mount_point;
         }
         .context("Failed to prepare ext4 filesystem")?;
         Ok(())
